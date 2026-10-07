@@ -1,0 +1,14 @@
+name: cursor-acp
+manifest_version: 2
+version: 0.1.0
+kind: model-provider
+description: "Run Hermes on the Cursor subscription through the Cursor CLI's ACP server (`agent acp`). Hermes keeps its own tools, memory and skills; Cursor's own tool calls are denied and it runs in an empty private workspace."
+author: "Neeraj"
+license: MIT
+platforms:
+  - macos
+  - linux
+requires_hermes: ">=0.21.0"
+external_dependencies:
+  - command: agent
+capabilities: []
