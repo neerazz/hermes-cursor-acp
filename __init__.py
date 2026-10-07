@@ -25,7 +25,7 @@ from providers.base import ProviderProfile
 logger = logging.getLogger(__name__)
 
 CURSOR_MARKER_BASE_URL = "acp://cursor"
-_DEFAULT_MODE = "ask"
+_DEFAULT_MODE = "agent"  # measured: ask mode made gpt-5.6-sol refuse the bridge 2/5; the deny list is the real fence
 # Cursor's harness prompt pushes its native tools (Shell, Read, Edit...). Those are
 # cancelled by the shim, so the model must route every action through Hermes instead.
 _HARNESS_OVERRIDE = (
@@ -33,7 +33,8 @@ _HARNESS_OVERRIDE = (
     "You are the language model behind a different agent (Hermes). Every built-in Cursor tool "
     "(Shell, Read, Grep, Glob, Edit, Write, Search, MCP, todo) is DISABLED in this session and any "
     "call to one is automatically cancelled. Never call them.\n"
-    "To act, emit one or more <tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call> blocks "
+    "To act, emit one or more <tool_call>{\"id\": \"call_1\", \"type\": \"function\", \"function\": "
+    "{\"name\": \"<tool>\", \"arguments\": \"<JSON string>\"}}</tool_call> blocks "
     "as plain text using ONLY the tools listed below, then stop and wait: Hermes runs them and "
     "sends back the results in the next turn. If no tool is needed, answer directly.\n\n"
 )
@@ -96,6 +97,137 @@ def _bare(model_id: str) -> str:
     return str(model_id or "").split("[", 1)[0].strip()
 
 
+_ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant", "tool": "Tool result"}
+
+
+def _render_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(
+            str(p.get("text", "")).strip() for p in content if isinstance(p, dict) and p.get("text")).strip()
+    if isinstance(content, dict) and "text" in content:
+        return str(content["text"]).strip()
+    return str(content).strip()
+
+
+def _render_message(msg: dict[str, Any]) -> str:
+    """Render one transcript message, including the assistant's prior tool calls so the model
+    sees its own <tool_call> history (the parent shim drops them, which breaks multi-step turns)."""
+    import json
+
+    role = str(msg.get("role") or "user").lower()
+    parts = [_render_content(msg.get("content"))]
+    for call in msg.get("tool_calls") or []:
+        fn = (call.get("function") if isinstance(call, dict) else getattr(call, "function", None)) or {}
+        name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", "")
+        args = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
+        try:
+            args_obj = json.loads(args) if isinstance(args, str) else args
+        except Exception:
+            args_obj = args
+        parts.append("<tool_call>" + json.dumps(
+            {"id": (call.get("id") if isinstance(call, dict) else getattr(call, "id", None)) or "call_1",
+             "type": "function", "function": {"name": name, "arguments": args if isinstance(args, str)
+                                               else json.dumps(args_obj, ensure_ascii=False)}},
+            ensure_ascii=False) + "</tool_call>")
+    label = _ROLE_LABELS.get(role, "Context")
+    if role == "tool" and msg.get("name"):
+        label = f"Tool result ({msg['name']})"
+    body = "\n".join(p for p in parts if p)
+    return f"{label}:\n{body}" if body else ""
+
+
+def _format_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, tool_choice: Any) -> str:
+    """Hermes conversation -> one Cursor prompt. Tool contract up front AND a reminder at the
+    end: recency is what keeps GPT/Composer from reaching for Cursor's own tools."""
+    from agent.acp_openai_bridge import render_tool_bridge_sections, tool_specs_from_openai_tools
+
+    sections = [_HARNESS_OVERRIDE.strip(), *render_tool_bridge_sections(tools, tool_choice)]
+    transcript = [r for r in (_render_message(m) for m in messages if isinstance(m, dict)) if r]
+    if transcript:
+        sections.append("Conversation so far:\n\n" + "\n\n".join(transcript))
+    names = [s["name"] for s in tool_specs_from_openai_tools(tools)]
+    if names:
+        sections.append(
+            "Now continue as the Assistant. The tools you CAN use are exactly: " + ", ".join(names) + ". "
+            "They are real and wired: Hermes executes them on the user's machine when you emit "
+            "<tool_call>{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"<tool>\", "
+            "\"arguments\": \"<JSON string>\"}}</tool_call>. If the task needs one, "
+            "emit the block now and stop. Do not claim a tool is unavailable, and do not use Cursor's "
+            "built-in tools; they are refused.")
+    else:
+        sections.append("Now continue as the Assistant. No tools are available this turn; answer directly.")
+    return "\n\n".join(s.strip() for s in sections if s and s.strip())
+
+
+def extract_tool_calls(text: str) -> tuple[list[Any], str]:
+    """Pull every well-formed ``<tool_call>{json}</tool_call>`` block out of ``text``.
+
+    Hermes' bridge regex pairs the FIRST ``<tool_call>`` with the first ``</tool_call>``, so
+    when a model mentions the tag in prose before the real block ("emitting a `<tool_call>`
+    now: <tool_call>{...}</tool_call>") the span is invalid JSON and the call is silently
+    dropped. Hermes' parser also accepts ONLY the {"function": {...}} shape, silently dropping
+    the flat {"name", "arguments"} shape models commonly emit. Measured: 4 of 4 composer-2.5
+    'misses' in one run were real calls lost to these two defects. Each tag occurrence is
+    decoded independently and both shapes are accepted.
+    """
+    import json
+    import re
+
+    from agent.acp_openai_bridge import _parse_tool_call
+
+    if not isinstance(text, str) or "<tool_call>" not in text:
+        return [], (text or "").strip()
+    decoder = json.JSONDecoder()
+    calls: list[Any] = []
+    spans: list[tuple[int, int]] = []
+    for tag in re.finditer(r"<tool_call>", text):
+        pos = tag.end()
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text) or text[pos] != "{":
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, pos)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "function" not in obj and isinstance(obj.get("name"), str):
+            # Flat {"name", "arguments"} shape: models use it often and Hermes' parser only
+            # accepts {"function": {...}}, so it dropped these calls silently.
+            obj = {"id": obj.get("id"), "type": "function",
+                   "function": {"name": obj["name"], "arguments": obj.get("arguments", {})}}
+        close = re.match(r"\s*</tool_call>", text[end:])
+        span_end = end + close.end() if close else end
+        call = _parse_tool_call(json.dumps(obj), len(calls) + 1)
+        if call is not None:
+            calls.append(call)
+            spans.append((tag.start(), span_end))
+    cleaned, cursor = [], 0
+    for start, end in spans:
+        cleaned.append(text[cursor:start])
+        cursor = end
+    cleaned.append(text[cursor:])
+    return calls, "".join(cleaned).strip()
+
+
+def _set_model_with_retry(request: Any, session_id: str, model_id: str, attempts: int = 3) -> None:
+    """Cursor intermittently answers set_model with 'Internal error' when several sessions start
+    at once (measured 2 of 16 under 6-way parallelism). Retry before failing the turn."""
+    import time
+
+    for attempt in range(1, attempts + 1):
+        try:
+            request("session/set_model", {"sessionId": session_id, "modelId": model_id})
+            return
+        except RuntimeError as exc:
+            if attempt == attempts or "Internal error" not in str(exc):
+                raise
+            time.sleep(0.5 * attempt)
+
+
 def resolve_cursor_model(requested: str | None, available: list[dict[str, Any]]) -> str | None:
     """Map a Hermes model string onto one advertised Cursor modelId.
 
@@ -149,6 +281,32 @@ def _make_client_class():
                         "HERMES_CURSOR_ACP_COMMAND.") from exc
                 raise
 
+        def _create_chat_completion(self, *, model: str | None = None, messages: list[dict[str, Any]] | None = None,
+                                    timeout: Any = None, tools: list[dict[str, Any]] | None = None,
+                                    tool_choice: Any = None, stream: bool = False, **_: Any) -> Any:
+            # Own prompt + response shaping instead of the parent's Copilot-flavoured one:
+            # 1. The Copilot preamble ("use ACP capabilities") pushes Cursor models toward their
+            #    native tools; measured 2/4 bridged for gpt-5.6-sol and composer-2.5 with it.
+            # 2. The parent reports usage as all-zero numbers. Hermes reads a zero reading as REAL
+            #    usage, never marks the provider usage-less, and its proactive compression waits for
+            #    a count that never arrives. Cursor's ACP result has no usage ({"stopReason": ...}),
+            #    so report None honestly.
+            from types import SimpleNamespace
+
+            from agent.acp_openai_bridge import completion_to_stream_chunks
+            from agent.copilot_acp_client import _effective_timeout
+
+            prompt_text = _format_prompt(messages or [], tools, tool_choice)
+            response_text, reasoning = self._run_prompt(
+                prompt_text, timeout_seconds=_effective_timeout(timeout), model=model)
+            tool_calls, cleaned = extract_tool_calls(response_text)
+            message = SimpleNamespace(content=cleaned, tool_calls=tool_calls, reasoning=reasoning or None,
+                                      reasoning_content=reasoning or None, reasoning_details=None)
+            completion = SimpleNamespace(
+                choices=[SimpleNamespace(message=message, finish_reason="tool_calls" if tool_calls else "stop")],
+                usage=None, model=model or "cursor-acp")
+            return completion_to_stream_chunks(completion) if stream else completion
+
         def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
             with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
                 seen: list[str] = []
@@ -168,7 +326,7 @@ def _make_client_class():
                         f"Cursor does not offer model {model!r} on this account. "
                         "Run `agent models` to see the list.")
                 if model_id:
-                    _request("session/set_model", {"sessionId": session_id, "modelId": model_id})
+                    _set_model_with_retry(_request, session_id, model_id)
                 mode = os.environ.get("HERMES_CURSOR_ACP_MODE", _DEFAULT_MODE).strip()
                 if mode:
                     try:
@@ -179,7 +337,7 @@ def _make_client_class():
                 reasoning_parts: list[str] = []
                 _request(
                     "session/prompt",
-                    {"sessionId": session_id, "prompt": [{"type": "text", "text": _HARNESS_OVERRIDE + prompt_text}]},
+                    {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
                     text_parts=text_parts, reasoning_parts=reasoning_parts,
                 )
                 return "".join(text_parts), "".join(reasoning_parts)

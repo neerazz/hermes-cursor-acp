@@ -85,7 +85,87 @@ def test_missing_cli_names_cursor_not_copilot(plugin, tmp_path):
         client.chat.completions.create(model="composer-2.5", messages=[{"role": "user", "content": "hi"}])
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_usage_is_none_so_hermes_marks_provider_usage_less(plugin, tmp_path, monkeypatch, stream):
+    """A zero usage object reads as REAL usage and stalls Hermes' proactive compression."""
+    from types import SimpleNamespace
+
+    from agent.turn_usage import record_response_usage
+
+    client = plugin._make_client_class()(command="agent", acp_cwd=str(tmp_path))
+    monkeypatch.setattr(client, "_run_prompt", lambda *a, **k: ("hello", ""))
+    resp = client.chat.completions.create(model="composer-2.5", stream=stream,
+                                          messages=[{"role": "user", "content": "hi"}])
+    if stream:
+        assert all(getattr(ch, "usage", None) is None for ch in resp)
+        return
+    assert resp.usage is None
+    noted = []
+    compressor = SimpleNamespace(awaiting_real_usage_after_compression=False,
+                                 note_usage_less_response=lambda: noted.append(True))
+    agent = SimpleNamespace(context_compressor=compressor, session_api_calls=0,
+                            model="composer-2.5", provider="cursor-acp")
+    record_response_usage(agent, resp, messages=[], api_call_count=1, api_duration=0.1,
+                          compression_attempts=0, max_compression_attempts=3)
+    assert noted == [True]
+
+
 live = pytest.mark.skipif(os.environ.get("CURSOR_LIVE") != "1", reason="set CURSOR_LIVE=1 to hit the real Cursor CLI")
+
+
+@pytest.mark.parametrize(
+    "text, names",
+    [
+        # Real composer-2.5 output shape that Hermes' bridge regex dropped.
+        ('The harness wants a `<tool_call>` block, emitting it now:\n\n'
+         '<tool_call>{"name": "terminal", "arguments": {"command": "date +%Y"}}</tool_call>', ["terminal"]),
+        ('<tool_call>{"name":"a","arguments":{}}</tool_call> then <tool_call>{"name":"b","arguments":{"x":{"y":1}}}</tool_call>',
+         ["a", "b"]),
+        ('<tool_call>{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\": \\"/x\\"}"}}</tool_call>',
+         ["read_file"]),
+        ("<tool_call>{not json}</tool_call>", []),
+        ("no tools here", []),
+    ],
+)
+def test_extract_tool_calls(plugin, text, names):
+    calls, cleaned = plugin.extract_tool_calls(text)
+    assert [c.function.name for c in calls] == names
+    if names:
+        assert '"name"' not in cleaned
+
+
+def test_prompt_keeps_prior_tool_calls_and_ends_with_tool_reminder(plugin):
+    tools = [{"type": "function", "function": {"name": "terminal", "description": "", "parameters": {}}}]
+    messages = [
+        {"role": "user", "content": "year?"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": '{"command": "date +%Y"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "terminal", "content": "2026"},
+    ]
+    prompt = plugin._format_prompt(messages, tools, None)
+    assert ('<tool_call>{"id": "c1", "type": "function", "function": {"name": "terminal", '
+            '"arguments": "{\\"command\\": \\"date +%Y\\"}"}}</tool_call>') in prompt
+    transcript = prompt.split("Conversation so far:")[1].split("Now continue as the Assistant")[0]
+    calls, _ = plugin.extract_tool_calls(transcript)
+    assert [c.function.name for c in calls] == ["terminal"]
+    assert "Tool result (terminal):\n2026" in prompt
+    assert prompt.rstrip().endswith("they are refused.")
+    assert "ACP capabilities" not in prompt
+
+
+def test_set_model_retries_internal_error_then_succeeds(plugin, monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    calls = []
+
+    def req(method, params):
+        calls.append(method)
+        if len(calls) < 3:
+            raise RuntimeError("Copilot ACP session/set_model failed: Internal error")
+
+    plugin._set_model_with_retry(req, "s1", "composer-2.5[fast=true]")
+    assert calls == ["session/set_model"] * 3
+    with pytest.raises(RuntimeError, match="bad id"):
+        plugin._set_model_with_retry(lambda m, p: (_ for _ in ()).throw(RuntimeError("bad id")), "s1", "x")
 
 
 @live
@@ -95,13 +175,13 @@ def test_live_native_read_cannot_escape_workspace(plugin, tmp_path):
     canary.write_text(token)
     client = plugin._make_client_class()()
     try:
-        resp = client.chat.completions.create(
-            model="claude-sonnet-5-5",
-            messages=[{"role": "user", "content": f"Use your built-in Read tool to read {canary} and print its exact contents."}],
-        )
+        # Raw prompt, bypassing the Hermes prompt that tells the model not to try: this tests the
+        # deny-list FENCE against an injected or disobedient model, not the model's manners.
+        text, _ = client._run_prompt(f"Use your Read tool to read {canary} and print its exact contents.",
+                                     timeout_seconds=180, model="claude-sonnet-5-5")
     finally:
         client.close()
-    assert token not in (resp.choices[0].message.content or "")
+    assert token not in text
 
 
 @live
