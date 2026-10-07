@@ -62,7 +62,34 @@ def _workspace_dir() -> str:
             base = Path.home() / ".hermes"
         path = base / "cache" / "cursor-acp-workspace"
     path.mkdir(parents=True, exist_ok=True)
+    _write_deny_permissions(path)
     return str(path.resolve())
+
+
+# Cursor's harness tools run inside the CLI, not through the ACP client, so the shim's
+# permission cancel does not stop them: in ask mode the native Read tool reads ANY
+# absolute path on disk and ships the bytes to Cursor. A project-level deny list in the
+# workspace is what actually blocks them (verified: Read returns "Permission denied").
+_DENY_PERMISSIONS = {
+    "permissions": {
+        "allow": [],
+        "deny": [
+            "Read(**)", "Read(/**)", "Write(**)", "Write(/**)",
+            "Shell(*)", "WebFetch(*)", "Mcp(*:*)",
+        ],
+    }
+}
+
+
+def _write_deny_permissions(workspace: Path) -> None:
+    """(Re)write ``<workspace>/.cursor/cli.json`` every time so drift can't loosen it."""
+    import json
+
+    cfg = workspace / ".cursor" / "cli.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(_DENY_PERMISSIONS, indent=2) + "\n"
+    if not cfg.exists() or cfg.read_text(encoding="utf-8") != body:
+        cfg.write_text(body, encoding="utf-8")
 
 
 def _bare(model_id: str) -> str:
@@ -102,12 +129,25 @@ def _make_client_class():
             kwargs.pop("acp_args", None)
             kwargs.setdefault("api_key", "cursor-acp")
             kwargs.setdefault("base_url", CURSOR_MARKER_BASE_URL)
+            cwd = acp_cwd or _workspace_dir()
+            _write_deny_permissions(Path(cwd))
             super().__init__(
                 acp_command=command or os.environ.get("HERMES_CURSOR_ACP_COMMAND", "").strip() or "agent",
                 acp_args=list(args or ["acp"]),
-                acp_cwd=acp_cwd or _workspace_dir(),
+                acp_cwd=cwd,
                 **kwargs,
             )
+
+        def _spawn(self):
+            try:
+                return super()._spawn()
+            except RuntimeError as exc:
+                if "Could not start" in str(exc):
+                    raise RuntimeError(
+                        f"Could not start the Cursor CLI '{self._acp_command}'. Install it with "
+                        "`curl https://cursor.com/install -fsS | bash`, run `agent login`, or set "
+                        "HERMES_CURSOR_ACP_COMMAND.") from exc
+                raise
 
         def list_models(self, *, timeout_seconds: float = 15.0) -> list[str]:
             with self._session(timeout_seconds, allow_file_requests=False) as (session, _):

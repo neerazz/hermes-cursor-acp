@@ -8,7 +8,7 @@ Cursor doesn't expose a chat-completions API, but the Cursor CLI ships an ACP se
 
 - Hermes tool schemas are sent to the model as `<tool_call>` text, and Hermes runs those calls itself.
 - Cursor's native tools (Shell, Edit, Read, …) are declared disabled in the prompt. The shim cancels any permission request they make.
-- Cursor runs in an empty private workspace (`$HERMES_HOME/cache/cursor-acp-workspace`) in `ask` mode, so it can't read or edit your repo on its own.
+- Cursor runs in an empty private workspace (`$HERMES_HOME/cache/cursor-acp-workspace`) in `ask` mode. The plugin rewrites `.cursor/cli.json` in that workspace on every client start with a deny-all list (`Read`, `Write`, `Shell`, `WebFetch`, `Mcp`). This is load-bearing: Cursor's native tools run inside the CLI, not over ACP, and without the deny list its Read tool can open any absolute path on disk (caught by `test_live_native_read_cannot_escape_workspace`).
 - Models can be chosen by bare name (`claude-opus-5-5`) or by full advertised id (`claude-opus-5-5[context=300k,effort=high,fast=false]`). An unknown name raises an error instead of silently using Cursor's default.
 
 ## Install
