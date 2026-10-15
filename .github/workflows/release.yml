@@ -43,7 +43,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/.hermes-agent:${{ github.workspace }}
         run: |
-          pip install pytest
+          pip install pytest openai "ruamel.yaml"
           pytest tests -q -o addopts=
 
       - name: CLI smoke
