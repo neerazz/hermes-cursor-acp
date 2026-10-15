@@ -14,6 +14,16 @@ Cursor doesn't expose a chat-completions API, but the Cursor CLI ships an ACP se
 
 ## Install
 
+### Option 1: One-command install (recommended)
+
+```bash
+npx hermes-cursor-acp
+```
+
+This installs and enables the plugin in Hermes, verifies your Cursor CLI (`agent`) installation, and checks that your subscription models are accessible.
+
+### Option 2: Manual install
+
 ```bash
 curl https://cursor.com/install -fsS | bash   # Cursor CLI
 agent login                                   # sign in with your Cursor account

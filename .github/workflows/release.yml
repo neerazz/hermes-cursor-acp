@@ -1,0 +1,95 @@
+name: release
+
+# Every push to main: test, pick the next version, publish to npm, tag the commit.
+# Publishing uses npm trusted publishing (GitHub OIDC), so the repo stores no npm token.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  HERMES_AGENT_REF: main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_AGENT_REF }}
+          path: .hermes-agent
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Python tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.hermes-agent:${{ github.workspace }}
+        run: |
+          pip install pytest
+          pytest tests -q -o addopts=
+
+      - name: CLI smoke
+        run: |
+          node --check bin/cli.js
+          node --check scripts/next-version.js
+          node bin/cli.js help
+          npm pack --dry-run
+
+  publish:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the vX.Y.Z tag
+      id-token: write   # npm trusted publishing (OIDC) + provenance
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Choose version
+        id: version
+        run: echo "version=$(node scripts/next-version.js)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+
+      - name: Tag and release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "hermes-cursor-acp v$VERSION" "$GITHUB_SHA"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" --verify-tag --generate-notes --title "v$VERSION"
+          {
+            echo "Published hermes-cursor-acp@$VERSION from $GITHUB_SHA"
+            echo ""
+            echo "- npm: https://www.npmjs.com/package/hermes-cursor-acp/v/$VERSION"
+            echo "- Hermes pin: \`hermes plugins install https://github.com/${GITHUB_REPOSITORY} --ref $GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
