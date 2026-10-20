@@ -55,10 +55,22 @@ def test_resolve_cursor_model(plugin, requested, expected):
 def test_profile_registered_as_external_process(plugin):
     p = plugin.cursor_acp
     assert p.name == "cursor-acp"
-    assert "cursor" in p.aliases
+    assert p.aliases == ("cursor-agent", "cursor-cli")
+    assert "cursor" not in p.aliases
+    assert "cursor-subscription" not in p.aliases
     assert p.auth_type == "external_process"
     assert p.base_url.startswith("acp://")
     assert p.process_command == "agent" and tuple(p.process_args) == ("acp",)
+
+
+def test_existing_cli_json_is_backed_up_before_overwrite(plugin, tmp_path):
+    cfg = tmp_path / ".cursor" / "cli.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    custom = '{"permissions": {"allow": ["Read(**)"], "deny": []}}\n'
+    cfg.write_text(custom, encoding="utf-8")
+    plugin._write_deny_permissions(tmp_path)
+    assert json.loads(cfg.read_text(encoding="utf-8")) == plugin._DENY_PERMISSIONS
+    assert (tmp_path / ".cursor" / "cli.json.bak").read_text(encoding="utf-8") == custom
 
 
 def test_workspace_gets_deny_list_and_heals_tampering(plugin, tmp_path, monkeypatch):
