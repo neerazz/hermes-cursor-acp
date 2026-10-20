@@ -83,13 +83,24 @@ _DENY_PERMISSIONS = {
 
 
 def _write_deny_permissions(workspace: Path) -> None:
-    """(Re)write ``<workspace>/.cursor/cli.json`` every time so drift can't loosen it."""
+    """(Re)write ``<workspace>/.cursor/cli.json`` every time so drift can't loosen it.
+
+    If a pre-existing custom ``.cursor/cli.json`` is present, preserve a backup at
+    ``.cursor/cli.json.bak`` before writing the deny policy.
+    """
     import json
 
     cfg = workspace / ".cursor" / "cli.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(_DENY_PERMISSIONS, indent=2) + "\n"
-    if not cfg.exists() or cfg.read_text(encoding="utf-8") != body:
+    if cfg.exists():
+        existing = cfg.read_text(encoding="utf-8")
+        if existing != body:
+            bak = workspace / ".cursor" / "cli.json.bak"
+            if not bak.exists():
+                bak.write_text(existing, encoding="utf-8")
+            cfg.write_text(body, encoding="utf-8")
+    else:
         cfg.write_text(body, encoding="utf-8")
 
 
@@ -235,7 +246,7 @@ def resolve_cursor_model(requested: str | None, available: list[dict[str, Any]])
     Returns None when nothing matches, so the session default is kept.
     """
     want = str(requested or "").strip()
-    if not want or want in {"cursor", "cursor-acp", "default"}:
+    if not want or want in {"cursor", "cursor-acp", "cursor-agent", "cursor-cli", "default"}:
         return None
     ids = [str(m.get("modelId") or "") for m in available if isinstance(m, dict)]
     if want in ids:
@@ -321,7 +332,7 @@ def _make_client_class():
                 session_id = str(session.get("sessionId") or "").strip()
                 available = (session.get("models") or {}).get("availableModels") or []
                 model_id = resolve_cursor_model(model, available)
-                if model and model_id is None and str(model).strip() not in {"cursor", "cursor-acp", "default"}:
+                if model and model_id is None and str(model).strip() not in {"cursor", "cursor-acp", "cursor-agent", "cursor-cli", "default"}:
                     raise RuntimeError(
                         f"Cursor does not offer model {model!r} on this account. "
                         "Run `agent models` to see the list.")
@@ -369,7 +380,7 @@ class CursorACPProfile(ProviderProfile):
 
 cursor_acp = CursorACPProfile(
     name="cursor-acp",
-    aliases=("cursor", "cursor-agent", "cursor-subscription"),
+    aliases=("cursor-agent", "cursor-cli"),
     display_name="Cursor Subscription (ACP)",
     description="Use your Cursor subscription models via the Cursor CLI (`agent acp`)",
     api_mode="chat_completions",
