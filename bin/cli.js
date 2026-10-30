@@ -9,8 +9,11 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const REPO = "https://github.com/neerazz/hermes-cursor-acp";
-const PLUGIN = "cursor-acp";
+const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8"));
+let REPO = pkg.repository?.url || "https://github.com/neerazz/hermes-cursor-acp";
+if (REPO.startsWith("git+")) REPO = REPO.slice(4);
+if (REPO.endsWith(".git")) REPO = REPO.slice(0, -4);
+const PLUGIN = pkg.name.replace(/^hermes-/, "");
 const CURSOR_INSTALLER = "https://cursor.com/install";
 const HERMES_DOCS = "https://hermes-agent.nousresearch.com/docs";
 

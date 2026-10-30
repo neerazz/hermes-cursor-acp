@@ -1,0 +1,3 @@
+## 2026-10-15 - [Regex performance in generation loops]
+**Learning:** In LLM stream parsing logic like `extract_tool_calls`, where the text buffer grows and the function is called on every new chunk, uncompiled regexes (`re.finditer`) and especially string slicing (`text[end:]`) can cause severe O(n^2) scaling issues and high execution time overheads. Also, inline imports add non-negligible latency.
+**Action:** Always hoist imports to the top level unless doing dynamic loading or solving cyclical imports. Use `re.compile()` for repetitive string operations and utilize the `pos` argument (e.g., `_TOOL_CALL_CLOSE_RE.match(text, end)`) instead of slicing large text buffers (`text[end:]`).

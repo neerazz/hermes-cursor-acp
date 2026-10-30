@@ -14,8 +14,10 @@ the full advertised id (``claude-opus-5-5[context=300k,effort=high,fast=false]``
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,8 @@ from providers.base import ProviderProfile
 logger = logging.getLogger(__name__)
 
 CURSOR_MARKER_BASE_URL = "acp://cursor"
+_TOOL_CALL_RE = re.compile(r"<tool_call>")
+_TOOL_CALL_CLOSE_RE = re.compile(r"\s*</tool_call>")
 _DEFAULT_MODE = "agent"  # measured: ask mode made gpt-5.6-sol refuse the bridge 2/5; the deny list is the real fence
 # Cursor's harness prompt pushes its native tools (Shell, Read, Edit...). Those are
 # cancelled by the shim, so the model must route every action through Hermes instead.
@@ -89,7 +93,6 @@ def _write_deny_permissions(workspace: Path) -> None:
     ``.cursor/cli.json.bak`` before writing the deny policy.
     """
     import json
-
     cfg = workspace / ".cursor" / "cli.json"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(_DENY_PERMISSIONS, indent=2) + "\n"
@@ -127,8 +130,6 @@ def _render_content(content: Any) -> str:
 def _render_message(msg: dict[str, Any]) -> str:
     """Render one transcript message, including the assistant's prior tool calls so the model
     sees its own <tool_call> history (the parent shim drops them, which breaks multi-step turns)."""
-    import json
-
     role = str(msg.get("role") or "user").lower()
     parts = [_render_content(msg.get("content"))]
     for call in msg.get("tool_calls") or []:
@@ -184,10 +185,10 @@ def extract_tool_calls(text: str) -> tuple[list[Any], str]:
     the flat {"name", "arguments"} shape models commonly emit. Measured: 4 of 4 composer-2.5
     'misses' in one run were real calls lost to these two defects. Each tag occurrence is
     decoded independently and both shapes are accepted.
-    """
-    import json
-    import re
 
+    ⚡ Bolt Optimization: Uses pre-compiled regexes and module-level imports
+    to reduce per-call execution time, as this function is run on every generation chunk.
+    """
     from agent.acp_openai_bridge import _parse_tool_call
 
     if not isinstance(text, str) or "<tool_call>" not in text:
@@ -195,7 +196,7 @@ def extract_tool_calls(text: str) -> tuple[list[Any], str]:
     decoder = json.JSONDecoder()
     calls: list[Any] = []
     spans: list[tuple[int, int]] = []
-    for tag in re.finditer(r"<tool_call>", text):
+    for tag in _TOOL_CALL_RE.finditer(text):
         pos = tag.end()
         while pos < len(text) and text[pos].isspace():
             pos += 1
@@ -210,8 +211,8 @@ def extract_tool_calls(text: str) -> tuple[list[Any], str]:
             # accepts {"function": {...}}, so it dropped these calls silently.
             obj = {"id": obj.get("id"), "type": "function",
                    "function": {"name": obj["name"], "arguments": obj.get("arguments", {})}}
-        close = re.match(r"\s*</tool_call>", text[end:])
-        span_end = end + close.end() if close else end
+        close = _TOOL_CALL_CLOSE_RE.match(text, end)
+        span_end = close.end() if close else end
         call = _parse_tool_call(json.dumps(obj), len(calls) + 1)
         if call is not None:
             calls.append(call)
