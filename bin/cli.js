@@ -77,8 +77,8 @@ async function install() {
   }
 
   console.log(`\n✓ Done! Start Hermes with your Cursor subscription:\n`);
-  console.log(`  hermes --provider cursor -m claude-opus-5-5`);
-  console.log(`  hermes --provider cursor -m composer-2.5\n`);
+  console.log(`  hermes --provider cursor-acp -m claude-opus-5-5`);
+  console.log(`  hermes --provider cursor-acp -m composer-2.5\n`);
   console.log(`Or select 'Cursor Subscription (ACP)' from /model inside Hermes.`);
 }
 

@@ -36,7 +36,7 @@ hermes plugins enable cursor-acp
 ## Use
 
 ```bash
-hermes --provider cursor -m claude-opus-5-5
+hermes --provider cursor-acp -m claude-opus-5-5
 ```
 
 Or run `/model` inside Hermes and pick **Cursor Subscription (ACP)**.
