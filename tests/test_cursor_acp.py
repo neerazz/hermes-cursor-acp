@@ -180,6 +180,127 @@ def test_set_model_retries_internal_error_then_succeeds(plugin, monkeypatch):
         plugin._set_model_with_retry(lambda m, p: (_ for _ in ()).throw(RuntimeError("bad id")), "s1", "x")
 
 
+GLM_UNTAGGED = ('{"id": "call_1", "type": "function", "function": {"name": "terminal", '
+                '"arguments": "{\\"command\\": \\"echo X_$((6*7))\\"}"}}')
+
+
+def test_untagged_tool_call_json_is_parsed_only_for_offered_tools(plugin):
+    """Real glm-5p3 output: the call JSON with no <tool_call> tags. It was shown to the user as the answer."""
+    calls, cleaned = plugin.extract_tool_calls(GLM_UNTAGGED, ["terminal"])
+    assert [c.function.name for c in calls] == ["terminal"]
+    assert json.loads(calls[0].function.arguments) == {"command": "echo X_$((6*7))"}
+    assert cleaned == ""
+    fenced, cleaned = plugin.extract_tool_calls("```json\n" + GLM_UNTAGGED + "\n```", ["terminal"])
+    assert [c.function.name for c in fenced] == ["terminal"] and cleaned == ""
+    # JSON that names a tool Hermes did not offer is prose, not a call.
+    assert plugin.extract_tool_calls(GLM_UNTAGGED, ["read_file"])[0] == []
+    assert plugin.extract_tool_calls(GLM_UNTAGGED)[0] == []
+
+
+# Shapes copied from a live `agent acp` trace of refused native calls.
+NATIVE_ATTEMPTS = [
+    {"kind": "execute", "title": "`echo hi`", "rawInput": {"command": "echo hi"}},
+    {"kind": "execute", "title": "`echo hi`", "rawInput": {"command": "echo hi"}},  # the model retried
+    {"kind": "read", "title": "Read /etc/hosts", "rawInput": {"path": "/etc/hosts"}},
+    {"kind": "search", "title": "grep", "rawInput": {"pattern": "localhost", "path": "/etc"}},
+    {"kind": "other", "title": "hub: hub_list_servers",
+     "rawInput": {"providerIdentifier": "hub", "toolName": "hub_list_servers", "args": {}}},
+    {"kind": "search", "title": "grep", "rawInput": {}},  # input never arrived
+]
+
+
+def test_native_calls_translate_to_offered_hermes_tools(plugin):
+    offered = ["terminal", "read_file", "search_files", "mcp_hub_hub_list_servers"]
+    got = [(c["function"]["name"], json.loads(c["function"]["arguments"]))
+           for c in plugin.translate_native_calls(NATIVE_ATTEMPTS, offered)]
+    assert got == [
+        ("terminal", {"command": "echo hi"}),
+        ("read_file", {"path": "/etc/hosts"}),
+        ("search_files", {"pattern": "localhost", "path": "/etc"}),
+        ("mcp_hub_hub_list_servers", {}),
+    ]
+    # Only tools Hermes offered this turn are ever emitted.
+    assert [c["function"]["name"] for c in plugin.translate_native_calls(NATIVE_ATTEMPTS, ["read_file"])] == ["read_file"]
+    assert plugin.translate_native_calls(NATIVE_ATTEMPTS, []) == []
+
+
+TERMINAL_TOOL = [{"type": "function", "function": {
+    "name": "terminal", "description": "Run a shell command",
+    "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
+
+
+def _scripted_client(plugin, tmp_path, monkeypatch, turns):
+    """Client whose ACP session replays ``turns``: one (updates, text) pair per session/prompt."""
+    import contextlib
+    from types import SimpleNamespace
+
+    client = plugin._make_client_class()(command="agent", acp_cwd=str(tmp_path))
+    prompts: list[str] = []
+    script = iter(turns)
+
+    def request(method, params, *, text_parts=None, reasoning_parts=None):
+        if method != "session/prompt":
+            return {}
+        prompts.append(params["prompt"][0]["text"])
+        updates, text = next(script)
+        for update in [*updates, {"sessionUpdate": "agent_message_chunk", "content": {"text": text}}]:
+            client._handle_server_message(
+                {"method": "session/update", "params": {"update": update}}, process=SimpleNamespace(stdin=None),
+                cwd=str(tmp_path), text_parts=text_parts, reasoning_parts=reasoning_parts)
+        return {"stopReason": "end_turn"}
+
+    @contextlib.contextmanager
+    def session(timeout_seconds, **_):
+        yield {"sessionId": "s1", "models": {"availableModels": AVAILABLE}}, request
+
+    monkeypatch.setattr(client, "_session", session)
+    return client, prompts
+
+
+def test_refused_native_call_is_rerouted_to_hermes_tool(plugin, tmp_path, monkeypatch):
+    """The model used Cursor's Shell, the fence refused it, and the user was told to fix permissions."""
+    refused = [
+        {"sessionUpdate": "tool_call", "toolCallId": "t1", "kind": "execute", "status": "pending",
+         "title": "`echo hi`", "rawInput": {"command": "echo hi"}},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"},
+    ]
+    client, prompts = _scripted_client(plugin, tmp_path, monkeypatch, [
+        (refused, "Blocked by permissions configuration. Run /permissions and allow Shell.")])
+    msg = client.chat.completions.create(model="composer-2.5", tools=TERMINAL_TOOL,
+                                         messages=[{"role": "user", "content": "say hi"}]).choices[0].message
+    assert [c.function.name for c in msg.tool_calls] == ["terminal"]
+    assert json.loads(msg.tool_calls[0].function.arguments) == {"command": "echo hi"}
+    assert "permissions" not in msg.content  # the false "blocked" report never reaches the user
+    assert len(prompts) == 1
+
+
+def test_native_call_with_no_hermes_equivalent_gets_one_corrective_prompt(plugin, tmp_path, monkeypatch):
+    refused = [
+        {"sessionUpdate": "tool_call", "toolCallId": "t1", "kind": "other", "title": "MCP: tool", "rawInput": {}},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "title": "hub: bos_tabs",
+         "rawInput": {"providerIdentifier": "hub", "toolName": "bos_tabs", "args": {}}},
+    ]
+    client, prompts = _scripted_client(plugin, tmp_path, monkeypatch, [
+        (refused, "MCP tool execution blocked."),
+        ([], '<tool_call>{"name": "terminal", "arguments": {"command": "echo hi"}}</tool_call>'),
+    ])
+    msg = client.chat.completions.create(model="composer-2.5", tools=TERMINAL_TOOL,
+                                         messages=[{"role": "user", "content": "say hi"}]).choices[0].message
+    assert [c.function.name for c in msg.tool_calls] == ["terminal"]
+    assert len(prompts) == 2 and "refused" in prompts[1] and "terminal" in prompts[1]
+
+
+def test_bridged_call_ignores_native_attempts_from_the_same_turn(plugin, tmp_path, monkeypatch):
+    """A model that tried Shell, then emitted the text block itself, must not run the command twice."""
+    refused = [{"sessionUpdate": "tool_call", "toolCallId": "t1", "kind": "execute",
+                "rawInput": {"command": "echo hi"}}]
+    client, prompts = _scripted_client(plugin, tmp_path, monkeypatch, [
+        (refused, '<tool_call>{"name": "terminal", "arguments": {"command": "echo hi"}}</tool_call>')])
+    msg = client.chat.completions.create(model="composer-2.5", tools=TERMINAL_TOOL,
+                                         messages=[{"role": "user", "content": "say hi"}]).choices[0].message
+    assert len(msg.tool_calls) == 1 and len(prompts) == 1
+
+
 @live
 def test_live_native_read_cannot_escape_workspace(plugin, tmp_path):
     token = "CANARY_" + secrets.token_hex(8)
@@ -212,6 +333,63 @@ def test_live_hermes_tool_call_is_bridged(plugin):
     calls = resp.choices[0].message.tool_calls or []
     assert calls and calls[0].function.name == "terminal"
     assert "BRIDGE_OK" in calls[0].function.arguments
+
+
+LIVE_MODELS = [m.strip() for m in os.environ.get("CURSOR_LIVE_MODELS", "claude-sonnet-5-5").split(",") if m.strip()]
+LIVE_TRIALS = int(os.environ.get("CURSOR_LIVE_TRIALS", "1"))
+READ_FILE_TOOL = {"type": "function", "function": {
+    "name": "read_file", "description": "Read a text file",
+    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+
+
+@live
+@pytest.mark.parametrize("trial", range(LIVE_TRIALS))
+@pytest.mark.parametrize("model", LIVE_MODELS)
+def test_live_two_step_task_completes(plugin, tmp_path, model, trial):
+    """The whole job, per model: read a value it cannot guess, reason over it, act on the result.
+
+    Covers every route a call can take (text block, untagged JSON, refused native tool rerouted).
+    Pick models and repeats with CURSOR_LIVE_MODELS="a,b,c" CURSOR_LIVE_TRIALS=3.
+    """
+    import re
+    import subprocess
+
+    token, a, b = secrets.token_hex(6), secrets.randbelow(80) + 11, secrets.randbelow(80) + 11
+    canary = tmp_path / "canary.txt"
+    canary.write_text(f"{token} {a} {b}\n")
+    want = f"DONE_{token}_{a * b + 7}"
+    messages: list[dict] = [{"role": "user", "content": (
+        f"Step 1: use the terminal tool to run: cat {canary} . It prints a word and two integers. "
+        "Step 2: use the terminal tool to run: echo DONE_<word>_<N> where N is the product of the two "
+        "integers plus 7. Reply with only the output of step 2.")}]
+    client = plugin._make_client_class()()
+    read, final = False, ""
+    try:
+        for _ in range(6):
+            msg = client.chat.completions.create(model=model, messages=messages,
+                                                 tools=[*TERMINAL_TOOL, READ_FILE_TOOL]).choices[0].message
+            if not msg.tool_calls:
+                final = msg.content or ""
+                break
+            messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
+                {"id": c.id, "type": "function", "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                for c in msg.tool_calls]})
+            for c in msg.tool_calls:
+                args = json.loads(c.function.arguments or "{}")
+                cmd = str(args.get("command") or "").strip()
+                if c.function.name == "read_file" and str(args.get("path")) == str(canary):
+                    out = canary.read_text()
+                elif c.function.name == "terminal" and re.fullmatch(
+                        r"(cat\s+['\"]?%s['\"]?|echo\s+['\"]?DONE_\w+['\"]?)" % re.escape(str(canary)), cmd):
+                    out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10).stdout
+                else:
+                    out = "refused by the test: only the two task commands may run"
+                read = read or token in out
+                messages.append({"role": "tool", "tool_call_id": c.id, "name": c.function.name, "content": out})
+    finally:
+        client.close()
+    assert read, f"{model} never ran step 1 through Hermes; it said: {final[-300:]!r}"
+    assert want in final, f"{model} answered {final[-300:]!r}, wanted {want}"
 
 
 @live

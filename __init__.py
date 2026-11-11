@@ -3,7 +3,9 @@
 Cursor sells its models through an agent harness, not a chat-completions API, so this
 plugin reuses Hermes' built-in ACP shim (the same one ``copilot-acp`` uses) against
 ``agent acp``. Hermes' tools are bridged as ``<tool_call>`` text and executed by Hermes;
-Cursor's own permission requests are cancelled by the shim.
+Cursor's own permission requests are cancelled by the shim. When a model reaches for a
+native Cursor tool anyway, the fence refuses it and the same action is rerouted to the
+matching Hermes tool, so the user is not told to "fix permissions".
 
 Isolation: Cursor runs in an empty private workspace and is switched to ``ask`` mode
 (no edits, no command execution) so it cannot act on the repo by itself.
@@ -18,6 +20,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +32,9 @@ logger = logging.getLogger(__name__)
 CURSOR_MARKER_BASE_URL = "acp://cursor"
 _TOOL_CALL_RE = re.compile(r"<tool_call>")
 _TOOL_CALL_CLOSE_RE = re.compile(r"\s*</tool_call>")
+# A JSON object that opens a line, optionally inside a ``` fence: an untagged tool call.
+_UNTAGGED_CALL_RE = re.compile(r"(?m)^[ \t]*(?:```[a-zA-Z]*[ \t]*\n[ \t]*)?\{")
+_FENCE_CLOSE_RE = re.compile(r"\s*```")
 _DEFAULT_MODE = "agent"  # measured: ask mode made gpt-5.6-sol refuse the bridge 2/5; the deny list is the real fence
 # Cursor's harness prompt pushes its native tools (Shell, Read, Edit...). Those are
 # cancelled by the shim, so the model must route every action through Hermes instead.
@@ -175,7 +181,27 @@ def _format_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] |
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
 
 
-def extract_tool_calls(text: str) -> tuple[list[Any], str]:
+def _decode_call(obj: Any, index: int, tool_names: set[str] | None = None) -> Any:
+    """One decoded JSON object -> a Hermes tool call, or None when it is not one.
+
+    Accepts the flat {"name", "arguments"} shape models commonly emit; Hermes' parser only
+    accepts {"function": {...}} and dropped those calls silently. With ``tool_names`` the
+    call must name a tool Hermes offered this turn.
+    """
+    from agent.acp_openai_bridge import _parse_tool_call
+
+    if not isinstance(obj, dict):
+        return None
+    if "function" not in obj and isinstance(obj.get("name"), str):
+        obj = {"id": obj.get("id"), "type": "function",
+               "function": {"name": obj["name"], "arguments": obj.get("arguments", {})}}
+    fn = obj.get("function")
+    if tool_names is not None and (not isinstance(fn, dict) or fn.get("name") not in tool_names):
+        return None
+    return _parse_tool_call(json.dumps(obj), index)
+
+
+def extract_tool_calls(text: str, tool_names: list[str] | None = None) -> tuple[list[Any], str]:
     """Pull every well-formed ``<tool_call>{json}</tool_call>`` block out of ``text``.
 
     Hermes' bridge regex pairs the FIRST ``<tool_call>`` with the first ``</tool_call>``, so
@@ -186,12 +212,14 @@ def extract_tool_calls(text: str) -> tuple[list[Any], str]:
     'misses' in one run were real calls lost to these two defects. Each tag occurrence is
     decoded independently and both shapes are accepted.
 
+    Some models (measured: glm-5p3) emit the call JSON with no tags at all, and it was shown
+    to the user as the answer. When nothing was tagged and ``tool_names`` is given, a JSON
+    object that opens a line and names an offered tool is taken as the call.
+
     ⚡ Bolt Optimization: Uses pre-compiled regexes and module-level imports
     to reduce per-call execution time, as this function is run on every generation chunk.
     """
-    from agent.acp_openai_bridge import _parse_tool_call
-
-    if not isinstance(text, str) or "<tool_call>" not in text:
+    if not isinstance(text, str) or ("<tool_call>" not in text and not tool_names):
         return [], (text or "").strip()
     decoder = json.JSONDecoder()
     calls: list[Any] = []
@@ -206,23 +234,82 @@ def extract_tool_calls(text: str) -> tuple[list[Any], str]:
             obj, end = decoder.raw_decode(text, pos)
         except ValueError:
             continue
-        if isinstance(obj, dict) and "function" not in obj and isinstance(obj.get("name"), str):
-            # Flat {"name", "arguments"} shape: models use it often and Hermes' parser only
-            # accepts {"function": {...}}, so it dropped these calls silently.
-            obj = {"id": obj.get("id"), "type": "function",
-                   "function": {"name": obj["name"], "arguments": obj.get("arguments", {})}}
         close = _TOOL_CALL_CLOSE_RE.match(text, end)
         span_end = close.end() if close else end
-        call = _parse_tool_call(json.dumps(obj), len(calls) + 1)
+        call = _decode_call(obj, len(calls) + 1)
         if call is not None:
             calls.append(call)
             spans.append((tag.start(), span_end))
+    if not calls and tool_names:
+        offered, pos = set(tool_names), 0
+        for opener in _UNTAGGED_CALL_RE.finditer(text):
+            if opener.start() < pos:
+                continue
+            try:
+                obj, end = decoder.raw_decode(text, opener.end() - 1)
+            except ValueError:
+                continue
+            call = _decode_call(obj, len(calls) + 1, offered)
+            if call is not None:
+                close = _FENCE_CLOSE_RE.match(text, end) if "`" in opener.group(0) else None
+                pos = close.end() if close else end
+                calls.append(call)
+                spans.append((opener.start(), pos))
     cleaned, cursor = [], 0
     for start, end in spans:
         cleaned.append(text[cursor:start])
         cursor = end
     cleaned.append(text[cursor:])
     return calls, "".join(cleaned).strip()
+
+
+# Cursor reports every native tool attempt on the ACP stream as a ``tool_call`` update, with its
+# input, even when the deny list refuses it. kind -> (Hermes tool, rawInput -> arguments).
+_NATIVE_KIND_TO_HERMES = {
+    "execute": ("terminal", lambda raw: {"command": raw["command"]}),
+    "read": ("read_file", lambda raw: {"path": raw["path"]}),
+    "search": ("search_files", lambda raw: {"pattern": raw["pattern"], **({"path": raw["path"]} if raw.get("path") else {})}),
+}
+_NATIVE_REFUSED_NUDGE = (
+    "Your built-in tool call was refused, as the instructions said it would be. Nothing ran, and "
+    "no permission setting will change that. Re-issue the same action now as a "
+    "<tool_call>{{\"id\": \"call_1\", \"type\": \"function\", \"function\": {{\"name\": \"<tool>\", "
+    "\"arguments\": \"<JSON string>\"}}}}</tool_call> text block using one of: {names}. "
+    "Output only the block."
+)
+
+
+def translate_native_calls(attempts: list[dict[str, Any]], tool_names: list[str] | None) -> list[dict[str, Any]]:
+    """Refused native Cursor tool attempts -> the same action as Hermes tool calls.
+
+    A model that reaches for Cursor's Shell/Read/Grep/MCP instead of the text bridge gets a
+    denial from the fence and reports "blocked by permissions" to the user. The intent is on
+    the ACP stream, so run it through Hermes instead (its approvals and sandbox apply). Only
+    tools Hermes offered this turn are emitted; a repeated attempt is emitted once.
+    """
+    offered = set(tool_names or ())
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for attempt in attempts:
+        raw = attempt.get("rawInput") or {}
+        try:
+            if attempt.get("kind") in _NATIVE_KIND_TO_HERMES:
+                name, build = _NATIVE_KIND_TO_HERMES[attempt["kind"]]
+                args = build(raw)
+            else:  # MCP: {"providerIdentifier": "hub", "toolName": "bos_tabs", "args": {...}}
+                server, tool = str(raw.get("providerIdentifier") or ""), str(raw["toolName"])
+                name = next((n for n in (f"mcp_{server}_{tool}", f"mcp__{server}__{tool}", f"{server}_{tool}", tool)
+                             if n in offered), "")
+                args = raw.get("args") or {}
+        except (KeyError, TypeError):
+            continue
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if name not in offered or key in seen:
+            continue
+        seen.add(key)
+        out.append({"id": f"call_{len(out) + 1}", "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, default=str)}})
+    return out
 
 
 def _set_model_with_retry(request: Any, session_id: str, model_id: str, attempts: int = 3) -> None:
@@ -275,6 +362,7 @@ def _make_client_class():
             kwargs.setdefault("base_url", CURSOR_MARKER_BASE_URL)
             cwd = acp_cwd or _workspace_dir()
             _write_deny_permissions(Path(cwd))
+            self._native = threading.local()
             super().__init__(
                 acp_command=command or os.environ.get("HERMES_CURSOR_ACP_COMMAND", "").strip() or "agent",
                 acp_args=list(args or ["acp"]),
@@ -305,13 +393,14 @@ def _make_client_class():
             #    so report None honestly.
             from types import SimpleNamespace
 
-            from agent.acp_openai_bridge import completion_to_stream_chunks
+            from agent.acp_openai_bridge import completion_to_stream_chunks, tool_specs_from_openai_tools
             from agent.copilot_acp_client import _effective_timeout
 
+            names = [s["name"] for s in tool_specs_from_openai_tools(tools)]
             prompt_text = _format_prompt(messages or [], tools, tool_choice)
             response_text, reasoning = self._run_prompt(
-                prompt_text, timeout_seconds=_effective_timeout(timeout), model=model)
-            tool_calls, cleaned = extract_tool_calls(response_text)
+                prompt_text, timeout_seconds=_effective_timeout(timeout), model=model, tool_names=names)
+            tool_calls, cleaned = extract_tool_calls(response_text, names)
             message = SimpleNamespace(content=cleaned, tool_calls=tool_calls, reasoning=reasoning or None,
                                       reasoning_content=reasoning or None, reasoning_details=None)
             completion = SimpleNamespace(
@@ -328,7 +417,24 @@ def _make_client_class():
                         seen.append(name)
                 return seen
 
-        def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None) -> tuple[str, str]:
+        def _native_attempts(self) -> dict[str, dict[str, Any]]:
+            """Native Cursor tool attempts seen on this thread's ACP stream, by toolCallId."""
+            if not hasattr(self._native, "calls"):
+                self._native.calls = {}
+            return self._native.calls
+
+        def _handle_server_message(self, msg: dict[str, Any], **kwargs: Any) -> bool:
+            # The parent drops ``tool_call`` updates. They are the only record that the model
+            # reached for a native Cursor tool, and they carry the input it wanted to run.
+            if msg.get("method") == "session/update":
+                update = (msg.get("params") or {}).get("update") or {}
+                if update.get("sessionUpdate") in ("tool_call", "tool_call_update") and update.get("toolCallId"):
+                    entry = self._native_attempts().setdefault(str(update["toolCallId"]), {})
+                    entry.update({k: update[k] for k in ("kind", "title", "rawInput") if update.get(k)})
+            return super()._handle_server_message(msg, **kwargs)
+
+        def _run_prompt(self, prompt_text: str, *, timeout_seconds: float, model: str | None = None,
+                        tool_names: list[str] | None = None) -> tuple[str, str]:
             with self._session(timeout_seconds) as (session, _request):
                 session_id = str(session.get("sessionId") or "").strip()
                 available = (session.get("models") or {}).get("availableModels") or []
@@ -345,14 +451,36 @@ def _make_client_class():
                         _request("session/set_mode", {"sessionId": session_id, "modeId": mode})
                     except Exception as exc:  # mode is defense in depth, not load-bearing
                         logger.warning("Cursor ACP set_mode(%s) failed: %s", mode, exc)
-                text_parts: list[str] = []
-                reasoning_parts: list[str] = []
-                _request(
-                    "session/prompt",
-                    {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
-                    text_parts=text_parts, reasoning_parts=reasoning_parts,
-                )
-                return "".join(text_parts), "".join(reasoning_parts)
+
+                def ask(text: str) -> tuple[str, str]:
+                    text_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    _request(
+                        "session/prompt",
+                        {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]},
+                        text_parts=text_parts, reasoning_parts=reasoning_parts,
+                    )
+                    return "".join(text_parts), "".join(reasoning_parts)
+
+                native = self._native_attempts()
+                native.clear()
+                text, reasoning = ask(prompt_text)
+                if not tool_names or not native or extract_tool_calls(text, tool_names)[0]:
+                    return text, reasoning
+                # The model reached for Cursor's own tools, the fence refused them, and its text
+                # now tells the user to fix permissions. Run what it meant through Hermes instead.
+                kinds = sorted({str(a.get("title") or a.get("kind") or "?") for a in native.values()})
+                rerouted = translate_native_calls(list(native.values()), tool_names)
+                if rerouted:
+                    logger.info("cursor-acp: model=%s used %d refused native tool call(s) %s; rerouted to Hermes: %s",
+                                model, len(native), kinds, [c["function"]["name"] for c in rerouted])
+                    return "".join(f"<tool_call>{json.dumps(c, ensure_ascii=False)}</tool_call>" for c in rerouted), reasoning
+                logger.info("cursor-acp: model=%s used refused native tool call(s) %s with no Hermes equivalent; "
+                            "re-prompting once", model, kinds)
+                retry_text, retry_reasoning = ask(_NATIVE_REFUSED_NUDGE.format(names=", ".join(tool_names)))
+                if extract_tool_calls(retry_text, tool_names)[0]:
+                    return retry_text, reasoning + retry_reasoning
+                return text, reasoning
 
     return CursorACPClient
 
