@@ -301,6 +301,36 @@ def test_bridged_call_ignores_native_attempts_from_the_same_turn(plugin, tmp_pat
     assert len(msg.tool_calls) == 1 and len(prompts) == 1
 
 
+PERIOD_USAGE = {
+    "billingCycleStart": "1794428549000",
+    "billingCycleEnd": "1797020549000",
+    "planUsage": {"totalSpend": 131, "includedSpend": 131, "remaining": 1869, "limit": 2000,
+                  "autoPercentUsed": 0.29111111111111115, "apiPercentUsed": 0,
+                  "totalPercentUsed": 0.26464646464646463},
+    "displayMessage": "You've used 7% of your included usage",
+}
+
+
+def test_usage_snapshot_reports_both_pools_like_cursors_dashboard(plugin):
+    """Cursor bills its own models and other models from separate pools and rounds each up."""
+    snapshot = plugin.cursor_usage_snapshot(PERIOD_USAGE)
+    windows = {w.label: w for w in snapshot.windows}
+    assert snapshot.available and snapshot.provider == "cursor-acp"
+    assert windows["Cursor models"].used_percent == 1.0
+    assert windows["Other models"].used_percent == 0.0
+    assert {w.reset_at.isoformat() for w in snapshot.windows} == {"2026-12-11T20:22:29+00:00"}
+
+
+def test_usage_snapshot_without_plan_usage_is_unavailable(plugin):
+    snapshot = plugin.cursor_usage_snapshot({"billingCycleEnd": "1797020549000"})
+    assert not snapshot.windows and snapshot.unavailable_reason
+
+
+def test_fetch_account_usage_without_cli_token_returns_none(plugin, monkeypatch):
+    monkeypatch.setattr(plugin, "_cursor_cli_token", lambda: None)
+    assert plugin.cursor_acp.fetch_account_usage() is None
+
+
 @live
 def test_live_native_read_cannot_escape_workspace(plugin, tmp_path):
     token = "CANARY_" + secrets.token_hex(8)
