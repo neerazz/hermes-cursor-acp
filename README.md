@@ -11,6 +11,7 @@ Cursor doesn't expose a chat-completions API, but the Cursor CLI ships an ACP se
 - The plugin rewrites `.cursor/cli.json` in an empty private workspace (`$HERMES_HOME/cache/cursor-acp-workspace`) every time a client starts, with a deny-all list (`Read`, `Write`, `Shell`, `WebFetch`, `Mcp`). This deny list is the security fence. Cursor's native tools run inside the CLI rather than over ACP, and without the list its Read tool can open any absolute path on disk.
 - Models can be chosen by bare name (`claude-opus-5-5`) or by full advertised id (`claude-opus-5-5[context=300k,effort=high,fast=false]`). An unknown name raises an error instead of silently using Cursor's default.
 - Responses report `usage=None`. Cursor sends no token counts, and a zero reading would stall Hermes' proactive context compression.
+- `/usage` and `hermes usage` show the plan's two pools, "Cursor models" (Grok, Composer) and "Other models", with the same percentages as Cursor's dashboard. The plugin reads the Cursor CLI's login from the macOS Keychain and calls the endpoint Cursor's dashboard uses. That endpoint is undocumented and may change.
 
 ## Install
 
@@ -73,7 +74,8 @@ Live results on 2026-10-06 (Hermes v0.21.5, Cursor CLI 2026.10.01):
 ## Known limits
 
 - Every turn starts a new ACP session. That adds 7–16s of latency and about 17k tokens of Cursor's harness prompt.
-- Hermes records no token or cost data for these calls, so `/usage` and `/insights` undercount.
+- Hermes records no token or cost data for these calls, so the token counts in `/usage` and `/insights` undercount.
+- Plan usage in `/usage` works on macOS only. The Linux lookup for the Cursor CLI's login is not implemented.
 - When several sessions start at once, Cursor occasionally answers `set_model` with `Internal error`. The plugin retries up to 3 times.
 - kimi-k2.7-code sometimes refuses the bridge in plain text without trying any tool. There is no call to reroute, so that turn ends with no action.
 
