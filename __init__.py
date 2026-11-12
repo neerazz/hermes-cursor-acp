@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
+import subprocess
+import sys
 import threading
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -485,11 +490,60 @@ def _make_client_class():
     return CursorACPClient
 
 
+_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+
+
+def _cursor_cli_token() -> str | None:
+    if sys.platform != "darwin":
+        return None
+    out = subprocess.run(["security", "find-generic-password", "-s", "cursor-access-token", "-w"],
+                         capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL)
+    return out.stdout.strip() or None
+
+
+def _fetch_current_period_usage(token: str) -> dict[str, Any]:
+    request = urllib.request.Request(_USAGE_URL, data=b"{}", method="POST", headers={
+        "Authorization": "Bearer " + token, "Content-Type": "application/json",
+        "Connect-Protocol-Version": "1"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
+def _datetime_from_epoch_ms(value: Any) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def cursor_usage_snapshot(body: dict[str, Any]) -> Any:
+    from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
+
+    plan_usage = body.get("planUsage") or {}
+    reset_at = _datetime_from_epoch_ms(body.get("billingCycleEnd"))
+    pools = (("Cursor models", "autoPercentUsed", "Includes Cursor Grok and Composer"),
+             ("Other models", "apiPercentUsed", None))
+    windows = tuple(
+        AccountUsageWindow(label=label, used_percent=float(math.ceil(plan_usage[field])),
+                           reset_at=reset_at, detail=detail, scope="model")
+        for label, field, detail in pools if plan_usage.get(field) is not None)
+    return AccountUsageSnapshot(
+        provider="cursor-acp", source="cursor_dashboard_api", fetched_at=datetime.now(timezone.utc),
+        windows=windows, unavailable_reason=None if windows else "Cursor reported no plan usage",
+        raw=body)
+
+
 class CursorACPProfile(ProviderProfile):
     """Cursor subscription via ``agent acp`` (external process, no REST endpoint)."""
 
     def create_client(self, **client_kwargs: Any) -> Any:
         return _make_client_class()(**client_kwargs)
+
+    def fetch_account_usage(self, *, base_url: str | None = None, api_key: str | None = None) -> Any:
+        token = _cursor_cli_token()
+        if not token:
+            return None
+        return cursor_usage_snapshot(_fetch_current_period_usage(token))
 
     def fetch_models(self, *, api_key: str | None = None, base_url: str | None = None,
                      timeout: float = 30.0) -> list[str] | None:
